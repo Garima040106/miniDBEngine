@@ -42,11 +42,12 @@ that key is the truth.
   See "Write-ahead log" below for the on-disk record format, why the
   fsync has to happen where it does, and how replay decides where the
   log's valid contents actually end.
-- **SSTables (sorted string tables)** *(planned)* — immutable on-disk
-  files holding a sorted run of key-value entries, produced by flushing
-  a full MemTable. Immutable means no in-place edits: a later write to
-  the same key lives in a *newer* SSTable (or the MemTable) and shadows
-  the old one at read time.
+- **SSTables (sorted string tables)** — immutable on-disk files holding a
+  sorted run of key-value entries, produced by flushing a full MemTable
+  once it crosses a size threshold. Immutable means no in-place edits: a
+  later write to the same key lives in a *newer* SSTable (or the
+  MemTable) and shadows the old one at read time. See "SSTable" below
+  for the on-disk format and how the sparse index speeds up lookups.
 - **Compaction** *(planned)* — a background process that merges several
   SSTables into fewer, larger ones: dropping keys that are shadowed by a
   newer file, and dropping tombstones once no older file could possibly
@@ -71,8 +72,9 @@ it makes a deleted key reappear from an older, still-present SSTable.
 
 1. Check the MemTable. If the key is there (live value or tombstone),
    that's the answer — it's the newest data in the system.
-2. *(planned)* If not, check on-disk SSTables from newest to oldest,
-   returning the first hit (live value or tombstone).
+2. If not, check on-disk SSTables from newest to oldest (`sstables_`
+   is stored oldest-first, so this walks it back to front), returning
+   the first hit (live value or tombstone).
 3. If nothing is found anywhere, or the first hit found is a tombstone,
    the key is absent as far as the public API is concerned.
 
@@ -92,10 +94,13 @@ sorted order.
    fsync doesn't actually change the durability guarantee (a crash at
    any point loses the whole process's memory regardless), but doing it
    after is easier to reason about, so that's the order used here.
-3. *(planned)* Once the MemTable exceeds a size threshold, flush it to a
-   new immutable SSTable (already sorted, so this is a straight
-   sequential write) and truncate the WAL, since the MemTable's
-   contents — now durable in the SSTable — no longer need log replay.
+3. Once the MemTable's approximate size crosses `flush_threshold_bytes`
+   (checked after every `put`/`remove`), flush it to a new immutable
+   SSTable (already sorted, so this is a straight sequential write) and
+   reset the WAL, since the MemTable's contents — now durable in the
+   SSTable — no longer need log replay. See "SSTable" below for why the
+   SSTable has to be durably on disk *before* the WAL is reset, not the
+   other way around.
 
 ## Write-ahead log
 
@@ -183,46 +188,112 @@ testable independent of any file I/O, and so the file-handling code (the
 `WriteAheadLog` class: opening the file, `write`+`fsync` on append,
 looping+truncating on replay) is a separate, thin layer on top.
 
-## On-disk formats: SSTable (planned — not implemented yet)
+## SSTable
 
-The WAL's on-disk format is documented above in "Write-ahead log", since
-it's implemented. Nothing below is built yet; this is the intended
-design for when SSTables and flushing are added.
-
-**SSTable** — immutable, written once, sorted by key:
+**On-disk format.** Three sections, written once and never modified:
 
 ```
-[ data block  ] repeated (key_len, key, tombstone_flag, value_len, value) entries, sorted
-[ index block ] sparse list of (key, offset) pairs into the data block,
-                so a lookup binary-searches the index, then does one
-                seek + linear scan within a small range - not a scan of
-                the whole file
-[ footer      ] fixed-size: offset + length of the index block, plus a
-                magic number to sanity-check the file on open
+[ data section  ]  one EncodeRecord()-framed record per entry, sorted by key -
+                    the exact same framing WAL records use (see "Write-ahead
+                    log" above): checksum, type, key_len, value_len, key, value
+[ index section ]  sparse: every 16th entry (by position), as
+                    (key_len uint32 LE, key bytes, offset uint64 LE)
+[ footer        ]  fixed 24 bytes, always at the very end:
+                    index_offset (u64 LE), index_size (u64 LE),
+                    entry_count (u32 LE, informational only),
+                    magic (u32 LE, sanity-checked on open)
 ```
 
-Read at file open time: mmap or open the file, read the footer to find
-the index, then keep the index in memory for lookups (this is the same
-shape LevelDB uses, simplified).
+Reusing the WAL's record framing for the data section is deliberate, not
+just convenient: it means SSTable entries get the same per-entry checksum
+WAL records do, which is useful for catching at-rest bit-rot in an
+immutable file - even though, unlike the WAL, that isn't what makes
+*writing* an SSTable crash-safe (see below).
+
+**Why writing an SSTable is crash-safe without needing the WAL's torn-
+write handling.** An SSTable is written once, as a single batch, not
+incrementally appended-to over its lifetime like the WAL is - so the
+failure mode "crash mid-write leaves a torn record at the tail that a
+reader has to detect" doesn't apply the same way here; the natural fix is
+simpler. `WriteSSTable` writes the complete file (data + index + footer)
+to `<name>.sst.tmp`, `fsync`s it, and only *then* atomically `rename()`s
+it to its real name. A crash at any point before the rename leaves
+either nothing or an ignored `.tmp` file behind - `Database` only ever
+discovers SSTables by their real, post-rename filenames, so a crash mid-
+flush is invisible to it. The rename itself is the one atomic step that
+makes the new SSTable exist at all, from any reader's point of view.
+
+That's also why the WAL is `Reset()` (truncated to empty) *only after*
+the rename succeeds, never before: if a crash happens between the rename
+and the `Reset()`, the WAL still has every write the flush just captured.
+On restart, replaying that WAL rebuilds a MemTable with the *same* data
+that's now also durably in the new SSTable - redundant, but harmless
+(`get()` checks the MemTable first and finds the same value either way),
+and the next successful flush cleans it up. Reversing the order - `Reset`
+before the rename - would be the real bug: a crash in that window would
+permanently lose whatever was in the MemTable, since neither the WAL
+(already truncated) nor the SSTable (rename never happened) would have it.
+
+**How the sparse index speeds up point lookups.** Indexing every key
+would cost about as much memory as the data itself. Instead, `Find(key)`:
+
+1. Binary-searches the small, fully-in-memory sparse index (`std::upper_
+   bound` over ~entries/16 items) for the last sampled key <= `key`.
+   Since the index inherits the data section's sort order, this identifies
+   exactly one *block* - the run of entries between that sampled key and
+   the next one - as the only place `key` could possibly be.
+2. Linearly scans just that block (at most 16 entries), stopping the
+   moment it finds an exact match, or a key greater than the target
+   (the data is sorted, so anything past that point can't match either).
+
+That's roughly `O(log(n/16))` for the binary search plus `O(16)` for the
+bounded scan, instead of `O(n)` for scanning the whole file or `O(n)`
+memory for a full index - the same "sparse index + bounded block scan"
+technique LevelDB/RocksDB/Cassandra all use. `ScanRaw(start, end)` uses
+the same index lookup to find where the *range* starts (skipping
+everything before it), then reads sequentially until it passes `end` -
+range scans don't get the same tight per-lookup bound a point lookup
+does, since a range can legitimately span many blocks, but they still
+avoid scanning from the beginning of a large file for a range that starts
+somewhere in the middle.
+
+**A deliberate simplification.** `SSTableReader` reads the entire file
+into memory once, at construction, rather than seeking into it on disk
+per lookup (`WriteAheadLog::Replay` does the same for the same reason).
+The sparse index still bounds how much of that in-memory buffer any one
+lookup has to inspect, which is the part of the technique this project
+is meant to demonstrate; real disk-backed, seek-per-lookup I/O (or an OS
+page cache doing the same job implicitly, which is closer to what
+LevelDB actually relies on) would be the natural next step if SSTables
+here ever needed to be larger than comfortably fits in memory.
 
 ## Current status
 
 Implemented: the `KVStore` interface, `MemTable` (in-memory, `std::map`-
-backed, with tombstone support), a `Database` class that currently just
-delegates every call straight to one `MemTable` (no SSTables yet - see
-below), a REPL (`PUT`/`GET`/`DEL`/`SCAN`), and the full write-ahead log:
-both the serialization layer (`EncodeRecord`/`DecodeRecord`/`Crc32` in
-`wal_record.h`/`.cpp`, pure, no file I/O) and the file-handling layer
-(`WriteAheadLog` in `wal.h`/`.cpp`: append+fsync, replay with torn/
-corrupt-tail detection, reset). Covered by unit tests, including the
-standard CRC32 test vectors and every torn/corrupt-record case described
-above, plus a simulated-restart (close, reopen, replay) test.
+backed, with tombstone support, approximate byte-size tracking for the
+flush threshold), the full write-ahead log (serialization layer plus the
+`WriteAheadLog` file-handling class), the SSTable writer (`WriteSSTable`,
+temp-file-then-rename) and reader (`SSTableReader`: sparse-index-backed
+point lookup and range scan), and `Database` wiring all of it together:
+it takes a directory (not just an in-memory instance), rediscovers
+existing SSTables and replays `wal.log` on construction, appends to the
+WAL before applying every `put`/`remove` to the MemTable, and flushes to
+a new SSTable (resetting the WAL right after) once the MemTable crosses
+the configured size threshold. `get()` checks the MemTable, then
+SSTables newest-to-oldest; `scan()` merges the MemTable and every
+SSTable's matching range, newest winning, tombstones dropped. Data now
+genuinely survives a process restart. Covered by unit tests, including
+flush-triggered reads that must fall through to an SSTable, a tombstone
+in the MemTable shadowing an older SSTable value, a newer SSTable winning
+over an older one for the same key, and a full simulated-restart (close,
+reopen, verify) test.
 
-Not implemented yet: `Database` doesn't actually call the WAL from
-`put`/`remove` or replay it on startup yet - that wiring, along with
-SSTables, flushing, and compaction, is next. So there's still no real
-persistence across restarts through `Database` itself yet, even though
-the WAL underneath it is already durable and crash-safe on its own.
+Not implemented yet: **compaction**. SSTables only ever accumulate - every
+flush adds one, none are ever merged or removed - so `get()`/`scan()`
+have to check a growing list of files over the store's lifetime, and a
+key that's been overwritten or deleted many times leaves every old
+version sitting on disk forever. That's the next planned piece (see
+"Components" above for what it's meant to do once it exists).
 
 ## File layout
 
@@ -234,22 +305,27 @@ tiny-lsm-kv/
 │   └── tinylsm/
 │       ├── kv_store.h          # KVStore abstract interface
 │       ├── memtable.h          # MemTable
-│       ├── database.h          # Database : public KVStore (wraps a MemTable for now)
+│       ├── database.h          # Database : public KVStore (MemTable + WAL + SSTables)
 │       ├── wal_record.h        # EncodeRecord/DecodeRecord/Crc32 - pure, no file I/O
-│       └── wal.h                # WriteAheadLog - append+fsync, replay, reset
+│       ├── wal.h                # WriteAheadLog - append+fsync, replay, reset
+│       └── sstable.h            # WriteSSTable, SSTableReader
 ├── src/
 │   ├── memtable.cpp
 │   ├── database.cpp
 │   ├── wal_record.cpp
 │   ├── wal.cpp
-│   └── repl.cpp                 # main() - the PUT/GET/DEL/SCAN REPL
+│   ├── sstable.cpp
+│   ├── byte_util.h              # internal: shared LE uint32/uint64 encode/decode
+│   ├── posix_io.h               # internal: shared WriteAll/ReadAll/ThrowErrno
+│   └── repl.cpp                 # main() - the PUT/GET/DEL/SCAN REPL, takes a db dir arg
 └── tests/
     ├── CMakeLists.txt          # fetches Catch2, defines the test binary
     ├── test_util.h              # TempDir - self-cleaning temp directory for file-backed tests
     ├── memtable_test.cpp
     ├── database_test.cpp
     ├── wal_record_test.cpp
-    └── wal_test.cpp
+    ├── wal_test.cpp
+    └── sstable_test.cpp
 ```
 
 ## Tooling
@@ -264,7 +340,10 @@ tiny-lsm-kv/
   ```bash
   ctest --test-dir build
   ```
-- **REPL**: `./build/src/tinylsm_repl` after building.
+- **REPL**: `./build/src/tinylsm_repl [db-directory]` after building
+  (defaults to `./tinylsm-data`). Data persists there across runs -
+  `PUT` a key, quit, relaunch pointed at the same directory, `GET` it
+  back.
 
 ## Conventions
 
@@ -272,11 +351,11 @@ tiny-lsm-kv/
   type. `std::string` is already binary-safe (it doesn't stop at `\0`),
   so this isn't a real limitation, just a simplification of the API
   surface.
-- `MemTable` (and later, SSTable readers) only ever deal in tombstones
-  vs. real values — "is this key absent" is a question the *caller*
-  (`Database`, and ultimately the public API) answers by treating a
-  tombstone as absent. Internally, absent and tombstoned are two
-  different states, on purpose, per the tombstone section above.
+- `MemTable` and `SSTableReader` only ever deal in tombstones vs. real
+  values — "is this key absent" is a question the *caller* (`Database`,
+  and ultimately the public API) answers by treating a tombstone as
+  absent. Internally, absent and tombstoned are two different states, on
+  purpose, per the tombstone section above.
 - No exceptions used for expected outcomes (a missing key isn't an
   error - that's what `std::optional` is for). Exceptions are reserved
   for real invariant violations.

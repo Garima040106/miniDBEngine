@@ -3,6 +3,7 @@ add_library(tinylsm_core
     database.cpp
     wal_record.cpp
     wal.cpp
+    sstable.cpp
 )
 target_include_directories(tinylsm_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_compile_features(tinylsm_core PUBLIC cxx_std_17)

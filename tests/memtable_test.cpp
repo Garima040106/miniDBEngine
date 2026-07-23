@@ -99,3 +99,44 @@ TEST_CASE("scan with no matching keys returns nothing", "[memtable]") {
     table.put("x", "1");
     REQUIRE(table.scan("a", "b").empty());
 }
+
+TEST_CASE("approximate_size_bytes starts at zero and grows with puts", "[memtable]") {
+    MemTable table;
+    REQUIRE(table.approximate_size_bytes() == 0);
+
+    table.put("ab", "xyz");  // 2 + 3 bytes
+    REQUIRE(table.approximate_size_bytes() == 5);
+
+    table.put("k", "v");  // + 1 + 1 bytes
+    REQUIRE(table.approximate_size_bytes() == 7);
+}
+
+TEST_CASE("overwriting a key adjusts size by the delta, not by adding the new size", "[memtable]") {
+    MemTable table;
+    table.put("key", "short");       // 3 + 5 = 8
+    table.put("key", "much-longer");  // replaces, not adds: 3 + 11 = 14
+
+    REQUIRE(table.approximate_size_bytes() == 14);
+}
+
+TEST_CASE("remove replaces a live entry's size with the (smaller) tombstone size", "[memtable]") {
+    MemTable table;
+    table.put("key", "some-value");  // 3 + 10 = 13
+    table.remove("key");             // tombstone: 3 + 0 = 3
+
+    REQUIRE(table.approximate_size_bytes() == 3);
+}
+
+TEST_CASE("entries() reflects the same sorted, tombstone-inclusive contents as the table", "[memtable]") {
+    MemTable table;
+    table.put("b", "2");
+    table.put("a", "1");
+    table.remove("b");
+
+    const auto& entries = table.entries();
+
+    REQUIRE(entries.size() == 2);
+    REQUIRE(entries.at("a").value == "1");
+    REQUIRE_FALSE(entries.at("a").is_tombstone);
+    REQUIRE(entries.at("b").is_tombstone);
+}

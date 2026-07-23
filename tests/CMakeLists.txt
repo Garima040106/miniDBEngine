@@ -11,6 +11,7 @@ add_executable(tinylsm_tests
     database_test.cpp
     wal_record_test.cpp
     wal_test.cpp
+    sstable_test.cpp
 )
 target_link_libraries(tinylsm_tests PRIVATE tinylsm_core Catch2::Catch2WithMain)
 target_include_directories(tinylsm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

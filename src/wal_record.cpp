@@ -2,9 +2,14 @@
 
 #include <array>
 
+#include "byte_util.h"
+
 namespace tinylsm {
 
 namespace {
+
+using detail::GetUint32LE;
+using detail::PutUint32LE;
 
 constexpr size_t kHeaderSize = 4 + 1 + 4 + 4;  // checksum + type + key_len + value_len
 
@@ -18,20 +23,6 @@ std::array<uint32_t, 256> MakeCrc32Table() {
         table[i] = crc;
     }
     return table;
-}
-
-void PutUint32LE(std::string* out, uint32_t value) {
-    out->push_back(static_cast<char>(value & 0xFF));
-    out->push_back(static_cast<char>((value >> 8) & 0xFF));
-    out->push_back(static_cast<char>((value >> 16) & 0xFF));
-    out->push_back(static_cast<char>((value >> 24) & 0xFF));
-}
-
-uint32_t GetUint32LE(const char* bytes) {
-    return (static_cast<uint32_t>(static_cast<unsigned char>(bytes[0]))) |
-           (static_cast<uint32_t>(static_cast<unsigned char>(bytes[1])) << 8) |
-           (static_cast<uint32_t>(static_cast<unsigned char>(bytes[2])) << 16) |
-           (static_cast<uint32_t>(static_cast<unsigned char>(bytes[3])) << 24);
 }
 
 bool IsValidRecordType(uint8_t type_byte) {

@@ -1,12 +1,31 @@
 #include "tinylsm/memtable.h"
 
+#include <utility>
+
 namespace tinylsm {
 
+namespace {
+
+size_t EntrySize(const std::string& key, const Entry& entry) { return key.size() + entry.value.size(); }
+
+}  // namespace
+
 void MemTable::put(const std::string& key, std::string value) {
-    table_[key] = Entry{std::move(value), false};
+    Upsert(key, Entry{std::move(value), false});
 }
 
-void MemTable::remove(const std::string& key) { table_[key] = Entry{std::string{}, true}; }
+void MemTable::remove(const std::string& key) { Upsert(key, Entry{std::string{}, true}); }
+
+void MemTable::Upsert(const std::string& key, Entry entry) {
+    auto it = table_.find(key);
+    if (it != table_.end()) {
+        approximate_size_bytes_ -= EntrySize(key, it->second);
+        it->second = std::move(entry);
+    } else {
+        it = table_.emplace(key, std::move(entry)).first;
+    }
+    approximate_size_bytes_ += EntrySize(key, it->second);
+}
 
 std::optional<std::string> MemTable::get(const std::string& key) const {
     const Entry* entry = find(key);

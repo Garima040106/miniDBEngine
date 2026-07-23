@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -18,9 +19,14 @@ void printHelp() {
 
 }  // namespace
 
-int main() {
-    tinylsm::Database db;
-    std::cout << "tiny-lsm-kv REPL. Type HELP for commands, EXIT to quit.\n";
+int main(int argc, char** argv) {
+    std::filesystem::path db_dir = (argc > 1) ? argv[1] : "./tinylsm-data";
+    tinylsm::Database db(db_dir);
+    std::cout << "tiny-lsm-kv REPL. Data directory: " << db_dir << "\n";
+    if (db.sstable_count() > 0) {
+        std::cout << "Recovered " << db.sstable_count() << " SSTable(s) from a previous run.\n";
+    }
+    std::cout << "Type HELP for commands, EXIT to quit.\n";
 
     std::string line;
     while (std::cout << "> " && std::getline(std::cin, line)) {

@@ -8,10 +8,7 @@ SSTables, and background compaction — all four of the moving parts a
 real LSM-tree needs, wired together end to end.
 
 For the architecture, on-disk formats, and the durability proof
-sketch, see [DESIGN.md](DESIGN.md). For the reasoning behind specific
-decisions (why fsync has to happen where it does, why the write-ahead
-log's records are framed the way they are, the locking strategy behind
-compaction, etc.), see [CLAUDE.md](CLAUDE.md).
+sketch, see [DESIGN.md](DESIGN.md).
 
 ## Public API
 

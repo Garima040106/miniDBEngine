@@ -201,4 +201,28 @@ std::vector<std::pair<std::string, Entry>> SSTableReader::ScanRaw(const std::str
     return results;
 }
 
+std::vector<std::pair<std::string, Entry>> SSTableReader::AllRaw() const {
+    std::vector<std::pair<std::string, Entry>> results;
+    std::string_view block(data_);
+    while (!block.empty()) {
+        DecodedRecord record;
+        if (DecodeRecord(block, &record) != DecodeStatus::kOk) {
+            throw std::runtime_error("corrupt SSTable data block in " + path_.string());
+        }
+        results.emplace_back(record.key, Entry{record.value, record.type == RecordType::kDelete});
+        block = block.substr(record.bytes_consumed);
+    }
+    return results;
+}
+
+std::map<std::string, Entry> MergeSSTables(const std::vector<std::shared_ptr<SSTableReader>>& readers) {
+    std::map<std::string, Entry> merged;
+    for (const auto& reader : readers) {  // oldest first, so later ones correctly overwrite
+        for (auto& [key, entry] : reader->AllRaw()) {
+            merged[key] = std::move(entry);
+        }
+    }
+    return merged;
+}
+
 }  // namespace tinylsm

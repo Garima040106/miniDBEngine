@@ -48,11 +48,13 @@ that key is the truth.
   later write to the same key lives in a *newer* SSTable (or the
   MemTable) and shadows the old one at read time. See "SSTable" below
   for the on-disk format and how the sparse index speeds up lookups.
-- **Compaction** *(planned)* — a background process that merges several
-  SSTables into fewer, larger ones: dropping keys that are shadowed by a
-  newer file, and dropping tombstones once no older file could possibly
-  still need them (i.e. once nothing older than the tombstone survives
-  the merge).
+- **Compaction** — a background thread, triggered once the SSTable count
+  crosses a configured threshold, that merges every current SSTable into
+  one: dropping keys that are shadowed by a newer file, and dropping
+  tombstones once no older file could possibly still need them (true
+  here specifically because it's always a *full* merge of everything
+  that currently exists — see "Compaction" below for the locking and
+  crash-safety this depends on).
 
 ## Tombstones
 
@@ -267,6 +269,63 @@ page cache doing the same job implicitly, which is closer to what
 LevelDB actually relies on) would be the natural next step if SSTables
 here ever needed to be larger than comfortably fits in memory.
 
+## Compaction
+
+**When it runs.** `Database` counts its SSTables after every flush; once
+that count reaches `compaction_trigger_count`, it signals a dedicated
+background thread (`CompactionThreadMain`/`CompactOnce`) via a small,
+purpose-built `std::mutex`+`std::condition_variable` pair
+(`compaction_cv_mutex_`/`compaction_cv_`) kept deliberately separate from
+the data lock below — so requesting/waiting for a compaction never
+contends with, or gets confused with, locking the actual data. Each run
+is a *full* compaction: every SSTable that exists at the moment the
+background thread wakes gets merged into exactly one new SSTable via
+`MergeSSTables` (`src/sstable.cpp`), which folds each reader's `AllRaw()`
+output into one `std::map<std::string, Entry>`, oldest-first, so a later
+reader's entry for a shared key always overwrites an earlier one.
+
+**Why tombstones are safe to drop here.** A tombstone can only be dropped
+once nothing *older* than it survives — otherwise a delete could
+"resurrect" an older value that was sitting in some SSTable the merge
+didn't touch. Because compaction here is always all-or-nothing (every
+current SSTable, no partial subsets), that condition is automatically
+satisfied at the end of every run: `CompactOnce` erases every tombstone
+that wins the merge before writing the compacted output, since by
+construction nothing older is left outside it.
+
+**Locking strategy.** A single `std::shared_mutex` (`mutex_` in
+`Database`) guards all of the store's mutable state (MemTable, WAL,
+`sstables_`). `get()`/`scan()` take it shared, so concurrent reads never
+block each other; `put()`/`remove()` take it exclusive. Compaction takes
+it only twice, both times briefly: once at the start, to copy the current
+`sstables_` list (a handful of cheap `shared_ptr` copies); once at the
+end, to replace it with `{compacted_reader, ...anything flushed while
+compacting}` in a single assignment. The expensive part in between —
+reading every entry out of several SSTables, merging them, and writing
+the result to a new file — runs with *no* lock held, so foreground
+`put()`/`get()`/`scan()` keep working uninterrupted while a compaction is
+in progress. Because the final swap is one assignment done under the
+exclusive lock, any concurrent read sees either the complete
+pre-compaction SSTable list or the complete post-compaction one — never a
+partially-swapped state.
+
+**Crash-safety.** Same temp-file-then-rename pattern flush already uses
+(see "SSTable" above): `WriteSSTable` writes the merged data to
+`<name>.sst.tmp`, `fsync`s it, then atomically renames it into place. The
+critical ordering property: the old SSTables are only deleted from disk
+*after* the new, merged SSTable has been durably renamed into place and
+swapped into `sstables_` under the lock. A crash before the rename leaves
+only an ignored `.tmp` file — nothing changes from any reader's point of
+view. A crash after the rename but before the old files are deleted
+leaves redundant data on disk (both the old SSTables and the new merged
+one, all correctly readable) — harmless, since SSTables are looked up by
+generation number and the merged file always has the highest number of
+the set, so it's already treated as authoritative; the old, now-
+redundant files just get swept up into whatever the *next* compaction
+merges, so this is self-healing rather than a leak. Nothing is ever
+deleted before its replacement is confirmed durable, so there's no window
+in which a crash could lose data.
+
 ## Current status
 
 Implemented: the `KVStore` interface, `MemTable` (in-memory, `std::map`-
@@ -274,26 +333,32 @@ backed, with tombstone support, approximate byte-size tracking for the
 flush threshold), the full write-ahead log (serialization layer plus the
 `WriteAheadLog` file-handling class), the SSTable writer (`WriteSSTable`,
 temp-file-then-rename) and reader (`SSTableReader`: sparse-index-backed
-point lookup and range scan), and `Database` wiring all of it together:
-it takes a directory (not just an in-memory instance), rediscovers
-existing SSTables and replays `wal.log` on construction, appends to the
-WAL before applying every `put`/`remove` to the MemTable, and flushes to
-a new SSTable (resetting the WAL right after) once the MemTable crosses
-the configured size threshold. `get()` checks the MemTable, then
-SSTables newest-to-oldest; `scan()` merges the MemTable and every
-SSTable's matching range, newest winning, tombstones dropped. Data now
-genuinely survives a process restart. Covered by unit tests, including
-flush-triggered reads that must fall through to an SSTable, a tombstone
-in the MemTable shadowing an older SSTable value, a newer SSTable winning
-over an older one for the same key, and a full simulated-restart (close,
-reopen, verify) test.
+point lookup and range scan, plus `AllRaw()` for compaction), background
+**compaction** (`MergeSSTables` plus `Database`'s compaction thread —
+triggered by SSTable count, correctly locked against concurrent reads and
+writes, crash-safe via the same temp-file-then-rename pattern as flush),
+and `Database` wiring all of it together: it takes a directory (not just
+an in-memory instance), rediscovers existing SSTables and replays
+`wal.log` on construction, appends to the WAL before applying every
+`put`/`remove` to the MemTable, flushes to a new SSTable (resetting the
+WAL right after) once the MemTable crosses the configured size threshold,
+and merges everything down to one SSTable once the SSTable count crosses
+`compaction_trigger_count`. `get()` checks the MemTable, then SSTables
+newest-to-oldest; `scan()` merges the MemTable and every SSTable's
+matching range, newest winning, tombstones dropped. Data genuinely
+survives a process restart, including mid-compaction crashes. Covered by
+unit tests, including flush-triggered reads that must fall through to an
+SSTable, a tombstone in the MemTable shadowing an older SSTable value, a
+newer SSTable winning over an older one for the same key, a full
+simulated-restart (close, reopen, verify) test, compaction merging
+several SSTables down to one, old values and tombstones actually
+disappearing from the compacted file on disk (not just losing a read-time
+race), a self-healing test for a crash between rename and old-file
+deletion, and a concurrent stress test (multiple threads doing puts/gets
+while compaction runs in the background).
 
-Not implemented yet: **compaction**. SSTables only ever accumulate - every
-flush adds one, none are ever merged or removed - so `get()`/`scan()`
-have to check a growing list of files over the store's lifetime, and a
-key that's been overwritten or deleted many times leaves every old
-version sitting on disk forever. That's the next planned piece (see
-"Components" above for what it's meant to do once it exists).
+All four originally planned components — MemTable, WAL, SSTables,
+compaction — are now implemented end to end.
 
 ## File layout
 
@@ -308,7 +373,7 @@ tiny-lsm-kv/
 │       ├── database.h          # Database : public KVStore (MemTable + WAL + SSTables)
 │       ├── wal_record.h        # EncodeRecord/DecodeRecord/Crc32 - pure, no file I/O
 │       ├── wal.h                # WriteAheadLog - append+fsync, replay, reset
-│       └── sstable.h            # WriteSSTable, SSTableReader
+│       └── sstable.h            # WriteSSTable, SSTableReader, MergeSSTables
 ├── src/
 │   ├── memtable.cpp
 │   ├── database.cpp

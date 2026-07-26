@@ -1,21 +1,50 @@
 #include <catch2/catch_test_macros.hpp>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "tinylsm/database.h"
 #include "tinylsm/kv_store.h"
+#include "tinylsm/sstable.h"
 #include "test_util.h"
 
 using tinylsm::Database;
+using tinylsm::Entry;
 using tinylsm::KVStore;
+using tinylsm::SSTableReader;
+using tinylsm::WriteSSTable;
 using tinylsm::test::TempDir;
 
 namespace {
 // Small enough that a couple of short puts push a MemTable over it,
 // so tests can force a flush without writing megabytes of data.
 constexpr size_t kTinyFlushThreshold = 32;
+
+// Even smaller: forces a flush on essentially every put, so tests that
+// need many SSTables don't need many keys per SSTable.
+constexpr size_t kFlushEveryWrite = 1;
+constexpr size_t kCompactAtThree = 3;
+
+// Asserts exactly one SSTable file exists in `dir` and returns a reader
+// for it - used by tests that want to inspect compacted output directly,
+// below the Database's get()/scan() (which would just report "not
+// found" for a dropped tombstone, not prove it was dropped).
+SSTableReader FindSingleSSTable(const std::filesystem::path& dir) {
+    std::vector<std::filesystem::path> sstables;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().extension() == ".sst") {
+            sstables.push_back(entry.path());
+        }
+    }
+    if (sstables.size() != 1) {
+        throw std::runtime_error("expected exactly one SSTable, found " +
+                                  std::to_string(sstables.size()));
+    }
+    return SSTableReader(sstables.front());
+}
 }  // namespace
 
 TEST_CASE("Database GET on a never-written key returns nullopt", "[database]") {
@@ -179,4 +208,158 @@ TEST_CASE("a delete survives closing and reopening the Database", "[database]") 
 
     Database reopened(dir.path);
     REQUIRE(reopened.get("key") == std::nullopt);
+}
+
+// --- Compaction ---
+
+TEST_CASE("WaitForBackgroundCompaction returns immediately when nothing was triggered",
+          "[database][compaction]") {
+    TempDir dir;
+    Database db(dir.path, kTinyFlushThreshold, kCompactAtThree);
+    db.WaitForBackgroundCompaction();  // must not hang
+    SUCCEED();
+}
+
+TEST_CASE("crossing the compaction trigger count merges SSTables down to one",
+          "[database][compaction]") {
+    TempDir dir;
+    Database db(dir.path, kFlushEveryWrite, kCompactAtThree);
+
+    db.put("a", "1");
+    db.put("b", "2");
+    db.put("c", "3");
+    db.WaitForBackgroundCompaction();
+
+    REQUIRE(db.sstable_count() == 1);
+    REQUIRE(db.get("a") == "1");
+    REQUIRE(db.get("b") == "2");
+    REQUIRE(db.get("c") == "3");
+}
+
+TEST_CASE("compaction drops the older value for an overwritten key, at the storage level",
+          "[database][compaction]") {
+    TempDir dir;
+    Database db(dir.path, kFlushEveryWrite, kCompactAtThree);
+
+    db.put("key", "old-value");
+    db.put("key", "new-value");
+    db.put("filler", "unrelated");  // crosses the trigger count
+    db.WaitForBackgroundCompaction();
+    REQUIRE(db.sstable_count() == 1);
+
+    // Inspect the compacted SSTable directly - if the old value merely
+    // lost to the new one at read time, that wouldn't prove it's gone
+    // from disk; AllRaw() over the single remaining file does.
+    auto entries = FindSingleSSTable(dir.path).AllRaw();
+    REQUIRE(entries.size() == 2);  // "key" once, "filler" once
+    for (const auto& [key, entry] : entries) {
+        if (key == "key") {
+            REQUIRE(entry.value == "new-value");
+        }
+    }
+}
+
+TEST_CASE("compaction drops a tombstone once nothing older can shadow it",
+          "[database][compaction]") {
+    TempDir dir;
+    Database db(dir.path, kFlushEveryWrite, kCompactAtThree);
+
+    db.put("key", "value");
+    db.remove("key");
+    db.put("filler", "unrelated");  // crosses the trigger count
+    db.WaitForBackgroundCompaction();
+    REQUIRE(db.sstable_count() == 1);
+
+    auto entries = FindSingleSSTable(dir.path).AllRaw();
+    for (const auto& [key, entry] : entries) {
+        REQUIRE(key != "key");  // tombstone and everything it shadowed are both gone
+    }
+    REQUIRE(db.get("key") == std::nullopt);  // still correctly absent through the API
+}
+
+TEST_CASE("compaction across more than two generations keeps only the newest value",
+          "[database][compaction]") {
+    TempDir dir;
+    Database db(dir.path, kFlushEveryWrite, kCompactAtThree);
+
+    db.put("key", "v1");
+    db.put("key", "v2");
+    db.put("key", "v3");
+    db.WaitForBackgroundCompaction();
+
+    REQUIRE(db.sstable_count() == 1);
+    REQUIRE(db.get("key") == "v3");
+}
+
+TEST_CASE("compacted data survives closing and reopening the Database", "[database][compaction]") {
+    TempDir dir;
+    {
+        Database db(dir.path, kFlushEveryWrite, kCompactAtThree);
+        db.put("a", "1");
+        db.put("b", "2");
+        db.put("c", "3");
+        db.WaitForBackgroundCompaction();
+        REQUIRE(db.sstable_count() == 1);
+    }
+
+    Database reopened(dir.path, kFlushEveryWrite, kCompactAtThree);
+    REQUIRE(reopened.sstable_count() == 1);
+    REQUIRE(reopened.get("a") == "1");
+    REQUIRE(reopened.get("b") == "2");
+    REQUIRE(reopened.get("c") == "3");
+}
+
+TEST_CASE("a crash between the compacted file's rename and the old files' deletion self-heals",
+          "[database][compaction]") {
+    // Simulates the exact window CompactOnce() can die in: the merged
+    // SSTable is already durably renamed into place, but the SSTables it
+    // replaces haven't been deleted yet. A fresh Database should just
+    // treat the highest-numbered file as authoritative and read
+    // correctly, with the (now redundant) old files self-healing away on
+    // the next real compaction rather than causing any incorrect read.
+    TempDir dir;
+
+    WriteSSTable(dir.path / "sst-000001.sst", {{"key", Entry{"stale-1", false}}});
+    WriteSSTable(dir.path / "sst-000002.sst", {{"key", Entry{"stale-2", false}}});
+    WriteSSTable(dir.path / "sst-000003.sst", {{"key", Entry{"fresh", false}}});
+
+    Database db(dir.path);
+
+    REQUIRE(db.sstable_count() == 3);  // all three rediscovered, none silently dropped
+    REQUIRE(db.get("key") == "fresh");  // highest generation number wins
+}
+
+TEST_CASE("concurrent puts and gets survive background compaction without data loss or a crash",
+          "[database][compaction]") {
+    TempDir dir;
+    Database db(dir.path, kFlushEveryWrite, kCompactAtThree);
+
+    constexpr int kThreads = 4;
+    constexpr int kOpsPerThread = 200;
+    std::atomic<bool> failed{false};
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&db, t, &failed] {
+            for (int i = 0; i < kOpsPerThread; ++i) {
+                const std::string key = "t" + std::to_string(t) + "-k" + std::to_string(i);
+                db.put(key, "value");
+                if (db.get(key) != "value") {
+                    failed = true;
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    db.WaitForBackgroundCompaction();
+
+    REQUIRE_FALSE(failed);
+    for (int t = 0; t < kThreads; ++t) {
+        for (int i = 0; i < kOpsPerThread; ++i) {
+            const std::string key = "t" + std::to_string(t) + "-k" + std::to_string(i);
+            REQUIRE(db.get(key) == "value");
+        }
+    }
 }

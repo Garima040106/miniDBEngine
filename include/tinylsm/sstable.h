@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -53,6 +54,11 @@ public:
     std::vector<std::pair<std::string, Entry>> ScanRaw(const std::string& start,
                                                          const std::string& end) const;
 
+    // Every entry in the table (tombstones included), in ascending key
+    // order - used by compaction, which needs the whole table rather
+    // than a bounded range.
+    std::vector<std::pair<std::string, Entry>> AllRaw() const;
+
     const std::filesystem::path& path() const { return path_; }
 
 private:
@@ -65,5 +71,19 @@ private:
     std::string data_;              // the file's data section, held in memory
     std::vector<IndexEntry> index_;
 };
+
+// Merges `readers` (must be given oldest first) into one map, keyed by
+// merged key, with the newest entry winning wherever the same key
+// appears in more than one reader - tombstones included in the result.
+//
+// This is the "what does the merged data look like" half of compaction,
+// deliberately kept separate from - and with no opinion about - the
+// "when do we compact, and is it now safe to drop tombstones" half,
+// which depends on whether anything *older* than `readers` still exists
+// (see CLAUDE.md's "Compaction" section). A full compaction of every
+// currently-known SSTable can drop every tombstone in this result
+// afterward, since nothing older survives it; a partial compaction of
+// only some SSTables could not.
+std::map<std::string, Entry> MergeSSTables(const std::vector<std::shared_ptr<SSTableReader>>& readers);
 
 }  // namespace tinylsm

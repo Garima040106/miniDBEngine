@@ -1,12 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 
 #include "tinylsm/sstable.h"
 #include "test_util.h"
 
 using tinylsm::Entry;
+using tinylsm::MergeSSTables;
 using tinylsm::SSTableReader;
 using tinylsm::WriteSSTable;
 using tinylsm::test::TempDir;
@@ -169,4 +171,64 @@ TEST_CASE("ScanRaw over an empty table returns nothing", "[sstable]") {
     SSTableReader reader(dir.path / "table.sst");
 
     REQUIRE(reader.ScanRaw("a", "z").empty());
+}
+
+// --- AllRaw / MergeSSTables ---
+
+TEST_CASE("AllRaw returns everything, including tombstones, in sorted order", "[sstable]") {
+    TempDir dir;
+    std::map<std::string, Entry> entries;
+    entries["a"] = Entry{"1", false};
+    entries["b"] = Entry{"", true};
+    entries["c"] = Entry{"3", false};
+    WriteSSTable(dir.path / "table.sst", entries);
+    SSTableReader reader(dir.path / "table.sst");
+
+    auto results = reader.AllRaw();
+
+    REQUIRE(results.size() == 3);
+    REQUIRE(results[0].first == "a");
+    REQUIRE(results[1].first == "b");
+    REQUIRE(results[1].second.is_tombstone);
+    REQUIRE(results[2].first == "c");
+}
+
+TEST_CASE("MergeSSTables lets a newer table's value win over an older one", "[sstable]") {
+    TempDir dir;
+    WriteSSTable(dir.path / "old.sst", {{"key", Entry{"old-value", false}}});
+    WriteSSTable(dir.path / "new.sst", {{"key", Entry{"new-value", false}}});
+    auto older = std::make_shared<SSTableReader>(dir.path / "old.sst");
+    auto newer = std::make_shared<SSTableReader>(dir.path / "new.sst");
+
+    auto merged = MergeSSTables({older, newer});  // oldest first
+
+    REQUIRE(merged.size() == 1);
+    REQUIRE(merged.at("key").value == "new-value");
+}
+
+TEST_CASE("MergeSSTables keeps a winning tombstone", "[sstable]") {
+    TempDir dir;
+    WriteSSTable(dir.path / "old.sst", {{"key", Entry{"value", false}}});
+    WriteSSTable(dir.path / "new.sst", {{"key", Entry{"", true}}});
+    auto older = std::make_shared<SSTableReader>(dir.path / "old.sst");
+    auto newer = std::make_shared<SSTableReader>(dir.path / "new.sst");
+
+    auto merged = MergeSSTables({older, newer});
+
+    REQUIRE(merged.size() == 1);
+    REQUIRE(merged.at("key").is_tombstone);
+}
+
+TEST_CASE("MergeSSTables unions keys that don't overlap between tables", "[sstable]") {
+    TempDir dir;
+    WriteSSTable(dir.path / "a.sst", {{"a", Entry{"1", false}}});
+    WriteSSTable(dir.path / "b.sst", {{"b", Entry{"2", false}}});
+    auto reader_a = std::make_shared<SSTableReader>(dir.path / "a.sst");
+    auto reader_b = std::make_shared<SSTableReader>(dir.path / "b.sst");
+
+    auto merged = MergeSSTables({reader_a, reader_b});
+
+    REQUIRE(merged.size() == 2);
+    REQUIRE(merged.at("a").value == "1");
+    REQUIRE(merged.at("b").value == "2");
 }
